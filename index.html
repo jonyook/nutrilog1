@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="apple-mobile-web-app-title" content="NutriLog"/>
+<meta name="theme-color" content="#1B4332"/>
+<title>NutriLog</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; padding: 0; background: #FAFAF7; font-family: -apple-system, BlinkMacSystemFont, 'Inter', system-ui, sans-serif; }
+  #root { min-height: 100vh; }
+  input, textarea, button, select { font-family: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React + Babel -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ─── API KEY + WORKSPACE GATE ──────────────────────────────────────────────
+const API_KEY_STORAGE = "nutrilog_api_key";
+const WORKSPACE_KEY_STORAGE = "nutrilog_workspace_id"; // NEW
+
+// ─── DAILY VALUES (FDA 2020) ───────────────────────────────────────────────
+const DV = {
+  calories:2000,protein:50,carbohydrates:275,fiber:28,fat:78,
+  vitaminA:900,vitaminB1:1.2,vitaminB2:1.3,vitaminB3:16,vitaminB5:5,
+  vitaminB6:1.7,vitaminB7:30,vitaminB9:400,vitaminB12:2.4,
+  vitaminC:90,vitaminD:20,vitaminE:15,vitaminK:120,
+  choline:550,iron:18,zinc:11,selenium:55,phosphorus:1250,
+  manganese:2.3,potassium:4700,magnesium:420,sodium:2300,copper:0.9,calcium:1300
+};
+const UNITS = {
+  calories:"kcal",protein:"g",carbohydrates:"g",fiber:"g",fat:"g",
+  vitaminA:"mcg",vitaminB1:"mg",vitaminB2:"mg",vitaminB3:"mg",vitaminB5:"mg",
+  vitaminB6:"mg",vitaminB7:"mcg",vitaminB9:"mcg",vitaminB12:"mcg",
+  vitaminC:"mg",vitaminD:"mcg",vitaminE:"mg",vitaminK:"mcg",
+  choline:"mg",iron:"mg",zinc:"mg",selenium:"mcg",phosphorus:"mg",
+  manganese:"mg",potassium:"mg",magnesium:"mg",sodium:"mg",copper:"mg",calcium:"mg"
+};
+const NUTRIENT_LABELS = {
+  calories:"Calories",protein:"Protein",carbohydrates:"Carbohydrates",fiber:"Fiber",fat:"Fat",
+  vitaminA:"Vitamin A",vitaminB1:"Vitamin B1 (Thiamine)",vitaminB2:"Vitamin B2 (Riboflavin)",
+  vitaminB3:"Vitamin B3 (Niacin)",vitaminB5:"Vitamin B5 (Pantothenic Acid)",
+  vitaminB6:"Vitamin B6",vitaminB7:"Vitamin B7 (Biotin)",vitaminB9:"Vitamin B9 (Folate)",
+  vitaminB12:"Vitamin B12",vitaminC:"Vitamin C",vitaminD:"Vitamin D",
+  vitaminE:"Vitamin E",vitaminK:"Vitamin K",choline:"Choline",
+  iron:"Iron",zinc:"Zinc",selenium:"Selenium",phosphorus:"Phosphorus",
+  manganese:"Manganese",potassium:"Potassium",magnesium:"Magnesium",
+  sodium:"Sodium",copper:"Copper",calcium:"Calcium"
+};
+const NUTRIENT_GROUPS = {
+  "Macronutrients":["calories","protein","carbohydrates","fiber","fat"],
+  "B Vitamins":["vitaminB1","vitaminB2","vitaminB3","vitaminB5","vitaminB6","vitaminB7","vitaminB9","vitaminB12"],
+  "Other Vitamins":["vitaminA","vitaminC","vitaminD","vitaminE","vitaminK","choline"],
+  "Minerals":["calcium","copper","iron","magnesium","manganese","phosphorus","potassium","selenium","sodium","zinc"]
+};
+const EMPTY_NUTRIENTS = () => Object.fromEntries(Object.keys(DV).map(k=>[k,0]));
+
+// ─── API ───────────────────────────────────────────────────────────────────
+// PATCHED: accepts workspaceId, adds header when present
+async function analyzeWithClaude(messages, systemPrompt, maxTokens=1000, apiKey, workspaceId) {
+  const headers = {
+    "Content-Type": "application/json",
+    "x-api-key": apiKey,
+    "anthropic-version": "2023-06-01",
+    "anthropic-dangerous-direct-browser-access": "true"
+  };
+  if (workspaceId && workspaceId.trim()) {
+    headers["anthropic-workspace-id"] = workspaceId.trim();
+  }
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST",
+    headers,
+    body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:maxTokens,system:systemPrompt,messages})
+  });
+  const data = await response.json();
+  if(data.error) throw new Error(data.error.message);
+  return data.content.map(b=>b.text||"").join("");
+}
+function fileToBase64(file) {
+  return new Promise((resolve,reject)=>{
+    const r=new FileReader();
+    r.onload=()=>resolve(r.result.split(",")[1]);
+    r.onerror=reject;
+    r.readAsDataURL(file);
+  });
+}
+
+// ─── PROMPTS ───────────────────────────────────────────────────────────────
+const DISH_PROMPT = `You are a registered dietitian and nutritional biochemist. Analyze this food and return ONLY valid JSON, no markdown:
+{"name":"string","servingDescription":"string","nutrients":{"calories":0,"protein":0,"carbohydrates":0,"fiber":0,"fat":0,"vitaminA":0,"vitaminB1":0,"vitaminB2":0,"vitaminB3":0,"vitaminB5":0,"vitaminB6":0,"vitaminB7":0,"vitaminB9":0,"vitaminB12":0,"vitaminC":0,"vitaminD":0,"vitaminE":0,"vitaminK":0,"choline":0,"iron":0,"zinc":0,"selenium":0,"phosphorus":0,"manganese":0,"potassium":0,"magnesium":0,"sodium":0,"copper":0,"calcium":0},"ingredients":[],"confidence":"high|medium|low","notes":"string"}
+Units: calories=kcal, protein/carbs/fiber/fat=g, vitaminA/B7/B9/B12/D/K/selenium=mcg, all others=mg. Use USDA data. If a nutrition label is visible, use those exact macros.`;
+
+const BULK_PROMPT = `You are a registered dietitian. Analyze this food image and return ONLY a valid JSON array of ALL distinct food items visible. No markdown:
+[{"name":"string","servingDescription":"string","nutrients":{"calories":0,"protein":0,"carbohydrates":0,"fiber":0,"fat":0,"vitaminA":0,"vitaminB1":0,"vitaminB2":0,"vitaminB3":0,"vitaminB5":0,"vitaminB6":0,"vitaminB7":0,"vitaminB9":0,"vitaminB12":0,"vitaminC":0,"vitaminD":0,"vitaminE":0,"vitaminK":0,"choline":0,"iron":0,"zinc":0,"selenium":0,"phosphorus":0,"manganese":0,"potassium":0,"magnesium":0,"sodium":0,"copper":0,"calcium":0},"confidence":"high|medium|low","notes":"string"}]
+Units: calories=kcal, protein/carbs/fiber/fat=g, vitaminA/B7/B9/B12/D/K/selenium=mcg, all others=mg. Extract every distinct dish/item visible.`;
+
+const MEAL_PROMPT = `You are a registered dietitian expert at estimating food portions from photos. Return ONLY valid JSON, no markdown:
+{"items":[{"dishName":"string — match database name or 'UNKNOWN: name'","estimatedServing":"string","servingMultiplier":1.0,"visualCues":"string","confidence":"high|medium|low"}],"mealNotes":"string"}
+Use visual cues like plate size and utensils to calibrate. Be precise.`;
+
+const SUPP_PROMPT = `You are a nutrition expert. Return ONLY valid JSON for this supplement/product, no markdown:
+{"name":"string","servingDescription":"string","nutrients":{"calories":0,"protein":0,"carbohydrates":0,"fiber":0,"fat":0,"vitaminA":0,"vitaminB1":0,"vitaminB2":0,"vitaminB3":0,"vitaminB5":0,"vitaminB6":0,"vitaminB7":0,"vitaminB9":0,"vitaminB12":0,"vitaminC":0,"vitaminD":0,"vitaminE":0,"vitaminK":0,"choline":0,"iron":0,"zinc":0,"selenium":0,"phosphorus":0,"manganese":0,"potassium":0,"magnesium":0,"sodium":0,"copper":0,"calcium":0},"issupplement":true,"confidence":"high|medium|low","notes":"string"}`;
+
+// ─── STORAGE ───────────────────────────────────────────────────────────────
+const STORAGE_KEY = "nutri_tracker_v2";
+const loadState = () => { try { const r=localStorage.getItem(STORAGE_KEY); return r?JSON.parse(r):null; } catch{return null;} };
+const saveState = s => { try{localStorage.setItem(STORAGE_KEY,JSON.stringify(s));}catch{} };
+const today = () => new Date().toISOString().split("T")[0];
+
+// ─── SMALL COMPONENTS ─────────────────────────────────────────────────────
+function NutrientBar({label,value,dv,unit}){
+  const pct=Math.min((value/dv)*100,200);
+  const displayPct=Math.min(pct,100);
+  const over=pct>100;
+  const color=over?"#c0392b":pct>=75?"#1B4332":pct>=40?"#95B8A2":"#D4A017";
+  return(
+    <div style={{marginBottom:8}}>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:3,color:"#333"}}>
+        <span style={{fontWeight:500}}>{label}</span>
+        <span style={{fontFamily:"monospace",color:over?"#c0392b":"#1B4332",fontWeight:over?700:400}}>
+          {value%1===0?value:value.toFixed(1)}{unit}&nbsp;
+          <span style={{color:"#666"}}>({Math.round(pct)}% DV)</span>
+        </span>
+      </div>
+      <div style={{height:7,background:"#e8e8e0",borderRadius:4,overflow:"hidden"}}>
+        <div style={{height:"100%",width:`${displayPct}%`,background:color,borderRadius:4,transition:"width 0.4s ease"}}/>
+      </div>
+    </div>
+  );
+}
+
+function DishCard({dish,onRemove,onAdd,compact}){
+  const conf={high:"#1B4332",medium:"#D4A017",low:"#c0392b"};
+  return(
+    <div style={{background:"#fff",border:"1px solid #ddd",borderRadius:10,padding:compact?10:14,marginBottom:8,boxShadow:"0 1px 4px rgba(0,0,0,0.06)"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+        <div style={{flex:1}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+            <strong style={{fontSize:compact?13:14,color:"#1B4332"}}>{dish.name}</strong>
+            {dish.isRecurring&&<span style={{fontSize:10,background:"#95B8A2",color:"#1B4332",padding:"1px 6px",borderRadius:99,fontWeight:600}}>RECURRING</span>}
+            {dish.issupplement&&<span style={{fontSize:10,background:"#fff3cd",color:"#856404",padding:"1px 6px",borderRadius:99,fontWeight:600}}>SUPPLEMENT</span>}
+            {dish.confidence&&<span style={{fontSize:10,color:conf[dish.confidence]||"#666"}}>● {dish.confidence}</span>}
+          </div>
+          <div style={{fontSize:11,color:"#888",marginTop:2}}>{dish.servingDescription}</div>
+          {!compact&&<div style={{fontSize:12,color:"#444",marginTop:4}}>{dish.nutrients.calories} kcal · {dish.nutrients.protein}g protein · {dish.nutrients.carbohydrates}g carbs · {dish.nutrients.fat}g fat</div>}
+        </div>
+        <div style={{display:"flex",gap:6,flexShrink:0,marginLeft:8}}>
+          {onAdd&&<button onClick={()=>onAdd(dish)} style={{background:"#1B4332",color:"#fff",border:"none",borderRadius:6,padding:"5px 12px",fontSize:12,cursor:"pointer"}}>+ Log</button>}
+          {onRemove&&<button onClick={onRemove} style={{background:"transparent",color:"#c0392b",border:"1px solid #c0392b",borderRadius:6,padding:"5px 10px",fontSize:12,cursor:"pointer"}}>✕</button>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Modal({title,onClose,children,wide}){
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.5)",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:16}} onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:"#FAFAF7",borderRadius:14,padding:24,maxWidth:wide?720:600,width:"100%",maxHeight:"90vh",overflowY:"auto",boxShadow:"0 8px 40px rgba(0,0,0,0.2)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18}}>
+          <h2 style={{margin:0,fontSize:18,color:"#1B4332"}}>{title}</h2>
+          <button onClick={onClose} style={{background:"none",border:"none",fontSize:24,cursor:"pointer",color:"#888",lineHeight:1}}>×</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP ──────────────────────────────────────────────────────────────
+function App(){
+  // PATCHED: load workspace ID alongside API key
+  const [apiKey,setApiKey]=useState(()=>localStorage.getItem(API_KEY_STORAGE)||"");
+  const [workspaceId,setWorkspaceId]=useState(()=>localStorage.getItem(WORKSPACE_KEY_STORAGE)||"");
+  const [apiKeyInput,setApiKeyInput]=useState("");
+  const [workspaceInput,setWorkspaceInput]=useState("");
+  const [apiKeySet,setApiKeySet]=useState(()=>!!localStorage.getItem(API_KEY_STORAGE));
+
+  const saved=loadState();
+  const [dishDatabase,setDishDatabase]=useState(saved?.dishDatabase||[]);
+  const [dailyLog,setDailyLog]=useState(saved?.dailyLog||{});
+  const [recurringItems,setRecurringItems]=useState(saved?.recurringItems||[]);
+  const [activeTab,setActiveTab]=useState("today");
+  const [selectedDate,setSelectedDate]=useState(today());
+
+  // modals
+  const [showAddDish,setShowAddDish]=useState(false);
+  const [showBulkAdd,setShowBulkAdd]=useState(false);
+  const [showLogMeal,setShowLogMeal]=useState(false);
+  const [showAddSupplement,setShowAddSupplement]=useState(false);
+  const [showDailySummary,setShowDailySummary]=useState(false);
+  const [showImportExport,setShowImportExport]=useState(false);
+
+  // add dish
+  const [dishForm,setDishForm]=useState({description:"",image:null,imagePreview:"",isRecurring:false});
+  const [pendingDish,setPendingDish]=useState(null);
+  const [isAnalyzing,setIsAnalyzing]=useState(false);
+  const [analyzeError,setAnalyzeError]=useState("");
+  const fileRef=useRef();
+
+  // bulk add
+  const [bulkPhotos,setBulkPhotos]=useState([]);
+  const [bulkResults,setBulkResults]=useState([]);
+  const [bulkProcessing,setBulkProcessing]=useState(false);
+  const [bulkDone,setBulkDone]=useState(false);
+  const bulkFileRef=useRef();
+
+  // log meal
+  const [mealLog,setMealLog]=useState({image:null,imagePreview:"",description:"",mealName:""});
+  const [mealEstimate,setMealEstimate]=useState(null);
+  const [mealItems,setMealItems]=useState([]);
+  const mealFileRef=useRef();
+
+  // supplement
+  const [suppForm,setSuppForm]=useState({name:"",extraInfo:""});
+
+  // sync
+  const [importText,setImportText]=useState("");
+  const [importError,setImportError]=useState("");
+  const [importSuccess,setImportSuccess]=useState("");
+  const [exportCopied,setExportCopied]=useState("");
+
+  useEffect(()=>{ saveState({dishDatabase,dailyLog,recurringItems}); },[dishDatabase,dailyLog,recurringItems]);
+
+  const todayKey=selectedDate;
+  const todayEntries=dailyLog[todayKey]||[];
+
+  const computeTotals=entries=>{
+    const totals=EMPTY_NUTRIENTS();
+    for(const e of entries){ const m=e.servingMultiplier??e.servings??1; for(const k of Object.keys(totals)) totals[k]+=(e.nutrients[k]||0)*m; }
+    for(const e of recurringItems){ const m=e.servings||1; for(const k of Object.keys(totals)) totals[k]+=(e.nutrients[k]||0)*m; }
+    return totals;
+  };
+  const totals=computeTotals(todayEntries);
+
+  const logDish=(dish,servings=1)=>{
+    const entry={...dish,servings,servingMultiplier:servings,loggedAt:new Date().toISOString(),logId:Date.now()+Math.random()};
+    setDailyLog(prev=>({...prev,[todayKey]:[...(prev[todayKey]||[]),entry]}));
+  };
+  const removeFromLog=logId=>setDailyLog(prev=>({...prev,[todayKey]:(prev[todayKey]||[]).filter(e=>e.logId!==logId)}));
+  const removeRecurring=idx=>setRecurringItems(prev=>prev.filter((_,i)=>i!==idx));
+
+  // ── Analyze single dish ── PATCHED: pass workspaceId
+  const analyzeDish=async()=>{
+    setIsAnalyzing(true);setAnalyzeError("");
+    try{
+      const content=[];
+      if(dishForm.image){ const b64=await fileToBase64(dishForm.image); content.push({type:"image",source:{type:"base64",media_type:dishForm.image.type,data:b64}}); }
+      if(dishForm.description) content.push({type:"text",text:dishForm.description});
+      if(!content.length){setAnalyzeError("Please add an image or description.");setIsAnalyzing(false);return;}
+      const raw=await analyzeWithClaude([{role:"user",content:content.length===1?(content[0].text||content):content}],DISH_PROMPT,1000,apiKey,workspaceId);
+      const parsed=JSON.parse(raw.replace(/```json|```/g,"").trim());
+      parsed.isRecurring=dishForm.isRecurring;
+      setPendingDish(parsed);
+    }catch(e){setAnalyzeError("Analysis failed: "+e.message);}
+    setIsAnalyzing(false);
+  };
+  const confirmDish=()=>{
+    const dish={...pendingDish,id:Date.now()+Math.random()};
+    if(dish.isRecurring) setRecurringItems(prev=>[...prev,{...dish,servings:1}]);
+    else setDishDatabase(prev=>[...prev,dish]);
+    setPendingDish(null);setShowAddDish(false);
+    setDishForm({description:"",image:null,imagePreview:"",isRecurring:false});
+  };
+
+  // ── Bulk add ── PATCHED: pass workspaceId
+  const startBulkAnalysis=async()=>{
+    if(!bulkPhotos.length)return;
+    setBulkProcessing(true);setBulkResults([]);
+    setBulkPhotos(prev=>prev.map(p=>({...p,status:"processing"})));
+    const allResults=[];
+    await Promise.all(bulkPhotos.map(async(photo,idx)=>{
+      try{
+        const b64=await fileToBase64(photo.file);
+        const content=[{type:"image",source:{type:"base64",media_type:photo.file.type,data:b64}}];
+        if(photo.description) content.push({type:"text",text:photo.description});
+        const raw=await analyzeWithClaude([{role:"user",content}],BULK_PROMPT,2000,apiKey,workspaceId);
+        const parsed=JSON.parse(raw.replace(/```json|```/g,"").trim());
+        const items=Array.isArray(parsed)?parsed:[parsed];
+        setBulkPhotos(prev=>prev.map((p,i)=>i===idx?{...p,status:"done",count:items.length}:p));
+        items.forEach(dish=>allResults.push({dish,selected:true,photoIdx:idx,tempId:Math.random()}));
+      }catch(e){
+        setBulkPhotos(prev=>prev.map((p,i)=>i===idx?{...p,status:"error",error:e.message}:p));
+      }
+    }));
+    setBulkResults(allResults);setBulkProcessing(false);setBulkDone(true);
+  };
+  const confirmBulkAdd=()=>{
+    const dishes=bulkResults.filter(r=>r.selected).map(r=>({...r.dish,id:Date.now()+Math.random(),isRecurring:false}));
+    setDishDatabase(prev=>[...prev,...dishes]);
+    setShowBulkAdd(false);setBulkPhotos([]);setBulkResults([]);setBulkDone(false);
+  };
+
+  // ── Log meal from photo ── PATCHED: pass workspaceId
+  const analyzeMealPhoto=async()=>{
+    setIsAnalyzing(true);setAnalyzeError("");
+    try{
+      if(!mealLog.image){setAnalyzeError("Please upload a photo.");setIsAnalyzing(false);return;}
+      const b64=await fileToBase64(mealLog.image);
+      const dbList=dishDatabase.map(d=>`- "${d.name}" (1 serving = ${d.servingDescription})`).join("\n");
+      const userText=`Meal photo. My description: ${mealLog.description||"(none)"}\n\nDatabase:\n${dbList||"(empty)"}\n\nEstimate serving sizes.`;
+      const raw=await analyzeWithClaude([{role:"user",content:[{type:"image",source:{type:"base64",media_type:mealLog.image.type,data:b64}},{type:"text",text:userText}]}],MEAL_PROMPT,1500,apiKey,workspaceId);
+      const parsed=JSON.parse(raw.replace(/```json|```/g,"").trim());
+      setMealEstimate(parsed);
+      const resolved=parsed.items.map(item=>{
+        const isUnknown=item.dishName.startsWith("UNKNOWN:");
+        const matchedDish=isUnknown?null:dishDatabase.find(d=>d.name.toLowerCase()===item.dishName.toLowerCase())||dishDatabase.find(d=>d.name.toLowerCase().includes(item.dishName.toLowerCase()))||dishDatabase.find(d=>item.dishName.toLowerCase().includes(d.name.toLowerCase()));
+        return{...item,matchedDish:matchedDish||null,include:!!matchedDish,isUnknown,cleanName:isUnknown?item.dishName.replace("UNKNOWN: ",""):item.dishName};
+      });
+      setMealItems(resolved);
+    }catch(e){setAnalyzeError("Failed: "+e.message);}
+    setIsAnalyzing(false);
+  };
+  const commitMealLog=()=>{
+    const mealLabel=mealLog.mealName||`Meal ${new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"})}`;
+    for(const item of mealItems.filter(i=>i.include&&i.matchedDish)){
+      const entry={...item.matchedDish,servingMultiplier:item.servingMultiplier,servings:item.servingMultiplier,loggedAt:new Date().toISOString(),logId:Date.now()+Math.random(),mealLabel,estimatedServing:item.estimatedServing,visualCues:item.visualCues};
+      setDailyLog(prev=>({...prev,[todayKey]:[...(prev[todayKey]||[]),entry]}));
+    }
+    setShowLogMeal(false);setMealLog({image:null,imagePreview:"",description:"",mealName:""});setMealEstimate(null);setMealItems([]);setAnalyzeError("");
+  };
+
+  // ── Supplement ── PATCHED: pass workspaceId
+  const analyzeSupplement=async()=>{
+    setIsAnalyzing(true);setAnalyzeError("");
+    try{
+      const raw=await analyzeWithClaude([{role:"user",content:`Product: ${suppForm.name}${suppForm.extraInfo?"\nInfo: "+suppForm.extraInfo:""}`}],SUPP_PROMPT,1000,apiKey,workspaceId);
+      const parsed=JSON.parse(raw.replace(/```json|```/g,"").trim());
+      setDishDatabase(prev=>[...prev,{...parsed,id:Date.now()+Math.random(),isRecurring:false}]);
+      setShowAddSupplement(false);setSuppForm({name:"",extraInfo:""});
+    }catch(e){setAnalyzeError("Failed: "+e.message);}
+    setIsAnalyzing(false);
+  };
+
+  // ── Export / Import ──
+  const exportData=scope=>{
+    const payload=scope==="database"
+      ?{version:1,scope:"database",exportedAt:new Date().toISOString(),dishDatabase,recurringItems}
+      :{version:1,scope:"full",exportedAt:new Date().toISOString(),dishDatabase,recurringItems,dailyLog};
+    const text=JSON.stringify(payload);
+    navigator.clipboard.writeText(text).then(()=>{setExportCopied(scope);setTimeout(()=>setExportCopied(""),3000);}).catch(()=>setExportCopied(scope+"_fallback_"+text));
+  };
+  const handleImportText=()=>{
+    setImportError("");setImportSuccess("");
+    try{
+      const data=JSON.parse(importText.trim());
+      if(!data.version||!data.scope) throw new Error("Not a NutriLog export.");
+      if(data.dishDatabase) setDishDatabase(prev=>{const ids=new Set(prev.map(d=>d.id));return[...prev,...data.dishDatabase.filter(d=>!ids.has(d.id))];});
+      if(data.recurringItems) setRecurringItems(prev=>{const ids=new Set(prev.map(d=>d.id));return[...prev,...data.recurringItems.filter(d=>!ids.has(d.id))];});
+      if(data.scope==="full"&&data.dailyLog) setDailyLog(prev=>{const m={...prev};for(const[date,entries]of Object.entries(data.dailyLog)){if(!m[date])m[date]=entries;else{const ids=new Set(m[date].map(e=>e.logId));m[date]=[...m[date],...entries.filter(e=>!ids.has(e.logId))];}}return m;});
+      setImportSuccess(`✓ Imported ${data.dishDatabase?.length||0} dishes${data.scope==="full"?` and ${Object.keys(data.dailyLog||{}).length} days`:""}`);
+      setImportText("");
+    }catch(err){setImportError("Import failed: "+err.message);}
+  };
+
+  const iS={width:"100%",border:"1px solid #ddd",borderRadius:8,padding:"9px 12px",fontSize:13,boxSizing:"border-box"};
+  const tabStyle=name=>({padding:"8px 18px",border:"none",borderRadius:20,cursor:"pointer",fontWeight:600,fontSize:13,background:activeTab===name?"#1B4332":"transparent",color:activeTab===name?"#fff":"#666",transition:"all 0.2s"});
+
+  // ── API KEY SCREEN ── PATCHED: added workspace ID field
+  if(!apiKeySet){
+    return(
+      <div style={{minHeight:"100vh",background:"#FAFAF7",display:"flex",alignItems:"center",justifyContent:"center",padding:24}}>
+        <div style={{maxWidth:400,width:"100%",background:"#fff",borderRadius:16,padding:28,boxShadow:"0 4px 24px rgba(0,0,0,0.1)"}}>
+          <div style={{textAlign:"center",marginBottom:24}}>
+            <div style={{fontSize:32,marginBottom:8}}>🥗</div>
+            <h1 style={{margin:0,fontSize:22,color:"#1B4332",fontWeight:700}}>NutriLog</h1>
+            <p style={{color:"#666",fontSize:13,marginTop:6}}>28-nutrient AI-powered meal tracker</p>
+          </div>
+          <div style={{marginBottom:14}}>
+            <label style={{fontSize:13,fontWeight:600,color:"#333",display:"block",marginBottom:6}}>Anthropic API Key</label>
+            <input type="password" value={apiKeyInput} onChange={e=>setApiKeyInput(e.target.value)}
+              placeholder="sk-ant-..." style={iS} />
+          </div>
+          {/* NEW: Workspace ID field */}
+          <div style={{marginBottom:16}}>
+            <label style={{fontSize:13,fontWeight:600,color:"#333",display:"block",marginBottom:6}}>
+              Workspace ID <span style={{fontWeight:400,color:"#888"}}>(optional)</span>
+            </label>
+            <input type="text" value={workspaceInput} onChange={e=>setWorkspaceInput(e.target.value)}
+              placeholder="wrkspc-..." style={iS} />
+            <p style={{fontSize:11,color:"#888",marginTop:6,lineHeight:1.5}}>
+              Required if your API key is workspace-scoped. Find it in{" "}
+              <a href="https://console.anthropic.com/settings/workspaces" target="_blank" style={{color:"#1B4332"}}>Console → Settings → Workspaces</a>.
+              Personal keys can leave this blank.
+            </p>
+          </div>
+          <p style={{fontSize:11,color:"#aaa",marginTop:0,marginBottom:16}}>Your key is stored only in this browser's localStorage and sent only to Anthropic's API.</p>
+          <button onClick={()=>{
+            if(!apiKeyInput.trim())return;
+            localStorage.setItem(API_KEY_STORAGE,apiKeyInput.trim());
+            setApiKey(apiKeyInput.trim());
+            if(workspaceInput.trim()){
+              localStorage.setItem(WORKSPACE_KEY_STORAGE,workspaceInput.trim());
+              setWorkspaceId(workspaceInput.trim());
+            }
+            setApiKeySet(true);
+          }}
+            disabled={!apiKeyInput.trim()}
+            style={{width:"100%",padding:12,background:apiKeyInput.trim()?"#1B4332":"#ccc",color:"#fff",border:"none",borderRadius:8,fontSize:14,fontWeight:700,cursor:apiKeyInput.trim()?"pointer":"default"}}>
+            Get Started
+          </button>
+          <p style={{fontSize:11,color:"#aaa",textAlign:"center",marginTop:12}}>
+            Get your API key at <a href="https://console.anthropic.com" target="_blank" style={{color:"#1B4332"}}>console.anthropic.com</a>
+          </p>
+          {/* NEW: link to update settings after setup */}
+        </div>
+      </div>
+    );
+  }
+
+  return(
+    <div style={{minHeight:"100vh",background:"#FAFAF7",fontFamily:"-apple-system,BlinkMacSystemFont,'Inter',system-ui,sans-serif",color:"#1a1a1a"}}>
+
+      {/* Header */}
+      <div style={{background:"#1B4332",color:"#fff",padding:"14px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+        <div>
+          <div style={{fontSize:20,fontWeight:700}}>NutriLog</div>
+          <div style={{fontSize:11,color:"#95B8A2"}}>28 nutrients · AI-powered</div>
+        </div>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          <button onClick={()=>setShowLogMeal(true)} style={{background:"#D4A017",color:"#fff",border:"none",borderRadius:8,padding:"7px 12px",fontWeight:700,fontSize:12,cursor:"pointer"}}>📷 Log Meal</button>
+          <button onClick={()=>setShowAddDish(true)} style={{background:"#95B8A2",color:"#1B4332",border:"none",borderRadius:8,padding:"7px 12px",fontWeight:600,fontSize:12,cursor:"pointer"}}>+ Dish</button>
+          <button onClick={()=>{setShowBulkAdd(true);setBulkPhotos([]);setBulkResults([]);setBulkDone(false);}} style={{background:"#95B8A2",color:"#1B4332",border:"none",borderRadius:8,padding:"7px 12px",fontWeight:600,fontSize:12,cursor:"pointer"}}>+ Bulk</button>
+          <button onClick={()=>setShowAddSupplement(true)} style={{background:"transparent",color:"#95B8A2",border:"1px solid #95B8A2",borderRadius:8,padding:"7px 12px",fontSize:12,cursor:"pointer"}}>+ Supp</button>
+          <button onClick={()=>{setShowImportExport(true);setImportError("");setImportSuccess("");}} style={{background:"transparent",color:"#95B8A2",border:"1px solid #95B8A2",borderRadius:8,padding:"7px 12px",fontSize:12,cursor:"pointer"}}>⇅ Sync</button>
+        </div>
+      </div>
+
+      {/* Quick stats */}
+      <div style={{background:"#fff",borderBottom:"1px solid #e8e8e0",padding:"10px 16px",display:"flex",gap:16,overflowX:"auto",alignItems:"center"}}>
+        {["calories","protein","carbohydrates","fat","fiber"].map(k=>(
+          <div key={k} style={{textAlign:"center",minWidth:56}}>
+            <div style={{fontSize:16,fontWeight:700,fontFamily:"monospace",color:"#1B4332"}}>{totals[k]%1===0?totals[k]:totals[k].toFixed(1)}</div>
+            <div style={{fontSize:10,color:"#888"}}>{NUTRIENT_LABELS[k].split(" ")[0]}</div>
+            <div style={{fontSize:10,color:"#95B8A2"}}>{Math.round((totals[k]/DV[k])*100)}%</div>
+          </div>
+        ))}
+        <div style={{marginLeft:"auto",flexShrink:0}}>
+          <button onClick={()=>setShowDailySummary(true)} style={{background:"#D4A017",color:"#fff",border:"none",borderRadius:8,padding:"7px 12px",fontSize:12,fontWeight:600,cursor:"pointer"}}>Full Report</button>
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{padding:"12px 16px 0",display:"flex",gap:6,overflowX:"auto"}}>
+        {[["today","Today"],["database","Database"],["recurring","Recurring"]].map(([id,label])=>(
+          <button key={id} style={tabStyle(id)} onClick={()=>setActiveTab(id)}>{label}</button>
+        ))}
+      </div>
+
+      <div style={{padding:"12px 16px 60px"}}>
+
+        {activeTab==="today"&&(
+          <div>
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+              <label style={{fontSize:13,color:"#666"}}>Date:</label>
+              <input type="date" value={selectedDate} onChange={e=>setSelectedDate(e.target.value)} style={{border:"1px solid #ddd",borderRadius:6,padding:"4px 10px",fontSize:13,background:"#fff"}}/>
+            </div>
+            {recurringItems.length>0&&(
+              <div style={{marginBottom:16}}>
+                <div style={{fontSize:12,color:"#888",fontWeight:700,marginBottom:8}}>RECURRING (every day)</div>
+                {recurringItems.map((item,i)=><DishCard key={i} dish={item} onRemove={()=>removeRecurring(i)} compact/>)}
+              </div>
+            )}
+            <div style={{fontSize:12,color:"#888",fontWeight:700,marginBottom:8}}>TODAY'S MEALS</div>
+            {todayEntries.length===0?(
+              <div style={{textAlign:"center",color:"#aaa",padding:"32px 0",fontSize:14}}>
+                No meals logged yet.<br/><span style={{fontSize:12}}>Tap 📷 Log Meal to photo your plate.</span>
+              </div>
+            ):todayEntries.map(entry=>(
+              <div key={entry.logId} style={{background:"#fff",border:"1px solid #ddd",borderRadius:10,padding:12,marginBottom:8,boxShadow:"0 1px 4px rgba(0,0,0,0.05)"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                  <div style={{flex:1}}>
+                    <div style={{fontWeight:600,fontSize:13,color:"#1B4332"}}>{entry.name}</div>
+                    {entry.mealLabel&&<div style={{fontSize:11,color:"#95B8A2",marginTop:1}}>📷 {entry.mealLabel}</div>}
+                    <div style={{fontSize:11,color:"#888",marginTop:2}}>
+                      {entry.estimatedServing||entry.servingDescription}
+                      {entry.servingMultiplier&&entry.servingMultiplier!==1&&<span style={{color:"#D4A017",fontWeight:600}}> × {Number(entry.servingMultiplier).toFixed(2)}</span>}
+                    </div>
+                    {entry.visualCues&&<div style={{fontSize:11,color:"#999",fontStyle:"italic",marginTop:1}}>{entry.visualCues}</div>}
+                    <div style={{fontSize:12,color:"#444",marginTop:3}}>{Math.round((entry.nutrients.calories||0)*(entry.servingMultiplier||1))} kcal · {((entry.nutrients.protein||0)*(entry.servingMultiplier||1)).toFixed(1)}g protein</div>
+                  </div>
+                  <button onClick={()=>removeFromLog(entry.logId)} style={{background:"transparent",color:"#c0392b",border:"1px solid #c0392b",borderRadius:6,padding:"4px 8px",fontSize:12,cursor:"pointer",marginLeft:8}}>✕</button>
+                </div>
+              </div>
+            ))}
+            {dishDatabase.length>0&&(
+              <div style={{marginTop:20}}>
+                <div style={{fontSize:12,color:"#888",fontWeight:700,marginBottom:8}}>LOG FROM DATABASE</div>
+                {dishDatabase.map(dish=><DishCard key={dish.id} dish={dish} onAdd={logDish} compact/>)}
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab==="database"&&(
+          <div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+              <div style={{fontSize:13,color:"#555"}}>{dishDatabase.length} dish{dishDatabase.length!==1?"es":""}</div>
+              <button onClick={()=>setShowAddDish(true)} style={{background:"#1B4332",color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:13,cursor:"pointer"}}>+ New Dish</button>
+            </div>
+            {dishDatabase.length===0?<div style={{textAlign:"center",color:"#aaa",padding:"32px 0",fontSize:14}}>No dishes yet.</div>
+              :dishDatabase.map(dish=><DishCard key={dish.id} dish={dish} onAdd={logDish} onRemove={()=>setDishDatabase(prev=>prev.filter(d=>d.id!==dish.id))}/>)}
+          </div>
+        )}
+
+        {activeTab==="recurring"&&(
+          <div>
+            <div style={{marginBottom:12,padding:12,background:"#e8f5e9",borderRadius:10,fontSize:13,color:"#1B4332"}}>Recurring items count toward every day automatically.</div>
+            <div style={{display:"flex",justifyContent:"flex-end",marginBottom:10}}>
+              <button onClick={()=>{setDishForm(f=>({...f,isRecurring:true}));setShowAddDish(true);}} style={{background:"#1B4332",color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:13,cursor:"pointer"}}>+ Add Recurring</button>
+            </div>
+            {recurringItems.length===0?<div style={{textAlign:"center",color:"#aaa",padding:"32px 0",fontSize:14}}>No recurring items.</div>
+              :recurringItems.map((item,i)=><DishCard key={i} dish={item} onRemove={()=>removeRecurring(i)}/>)}
+          </div>
+        )}
+      </div>
+
+      {/* ═══ LOG MEAL MODAL ═══ */}
+      {showLogMeal&&(
+        <Modal title="Log Meal from Photo" wide onClose={()=>{setShowLogMeal(false);setMealEstimate(null);setMealItems([]);setAnalyzeError("");}}>
+          {!mealEstimate?(
+            <div>
+              <div style={{marginBottom:10,padding:10,background:"#e8f5e9",borderRadius:8,fontSize:12,color:"#1B4332"}}>Photo your plate and describe what's on it. Claude will estimate serving sizes.</div>
+              <div style={{marginBottom:12}}>
+                <label style={{fontSize:13,fontWeight:600,color:"#333",display:"block",marginBottom:6}}>Meal Photo *</label>
+                <div onClick={()=>mealFileRef.current?.click()} style={{border:"2px dashed #D4A017",borderRadius:10,padding:16,textAlign:"center",cursor:"pointer",background:mealLog.imagePreview?"transparent":"#fffdf0"}}>
+                  {mealLog.imagePreview?<img src={mealLog.imagePreview} alt="meal" style={{maxHeight:200,borderRadius:8,maxWidth:"100%"}}/>
+                    :<div><div style={{fontSize:28,marginBottom:4}}>📷</div><div style={{color:"#D4A017",fontSize:13,fontWeight:600}}>Tap to upload plate photo</div></div>}
+                </div>
+                <input ref={mealFileRef} type="file" accept="image/*" style={{display:"none"}} onChange={e=>{const f=e.target.files[0];if(f)setMealLog(prev=>({...prev,image:f,imagePreview:URL.createObjectURL(f)}));}}/>
+              </div>
+              <div style={{marginBottom:12}}>
+                <label style={{fontSize:13,fontWeight:600,color:"#333",display:"block",marginBottom:6}}>What's on your plate?</label>
+                <textarea value={mealLog.description} onChange={e=>setMealLog(f=>({...f,description:e.target.value}))} placeholder="e.g. Left: grilled chicken. Right: roasted broccoli. Bottom: white rice." style={{...iS,height:80,resize:"vertical"}}/>
+              </div>
+              <div style={{marginBottom:16}}>
+                <input value={mealLog.mealName} onChange={e=>setMealLog(f=>({...f,mealName:e.target.value}))} placeholder="Meal name (optional)" style={iS}/>
+              </div>
+              {analyzeError&&<div style={{color:"#c0392b",fontSize:13,marginBottom:10}}>{analyzeError}</div>}
+              {dishDatabase.length===0&&<div style={{marginBottom:12,padding:10,background:"#fff3cd",borderRadius:8,fontSize:12,color:"#856404"}}>⚠️ Add dishes to your database first so Claude can match portions.</div>}
+              <button onClick={analyzeMealPhoto} disabled={isAnalyzing||!mealLog.image} style={{width:"100%",padding:12,background:isAnalyzing?"#95B8A2":"#D4A017",color:"#fff",border:"none",borderRadius:8,fontSize:14,fontWeight:700,cursor:isAnalyzing?"default":"pointer"}}>
+                {isAnalyzing?"Analyzing plate…":"Estimate Servings"}
+              </button>
+            </div>
+          ):(
+            <div>
+              {mealLog.imagePreview&&<img src={mealLog.imagePreview} alt="meal" style={{width:"100%",maxHeight:160,objectFit:"cover",borderRadius:10,marginBottom:12}}/>}
+              {mealEstimate.mealNotes&&<div style={{marginBottom:12,padding:10,background:"#f0f4ff",borderRadius:8,fontSize:12,color:"#444",fontStyle:"italic"}}>💬 {mealEstimate.mealNotes}</div>}
+              <div style={{fontSize:13,fontWeight:700,color:"#1B4332",marginBottom:10}}>Detected {mealItems.length} item{mealItems.length!==1?"s":""} — review before logging:</div>
+              {mealItems.map((item,idx)=>(
+                <div key={idx} style={{background:item.isUnknown?"#fff8f8":item.matchedDish?"#f8fff8":"#fffdf0",border:`1px solid ${item.isUnknown?"#f5c6c6":item.matchedDish?"#95B8A2":"#D4A017"}`,borderRadius:10,padding:12,marginBottom:8}}>
+                  <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
+                    <input type="checkbox" checked={item.include&&!!item.matchedDish} disabled={!item.matchedDish} onChange={e=>setMealItems(prev=>prev.map((it,i)=>i===idx?{...it,include:e.target.checked}:it))} style={{marginTop:3,flexShrink:0}}/>
+                    <div style={{flex:1}}>
+                      <div style={{fontWeight:600,fontSize:13,color:"#1B4332"}}>{item.cleanName}</div>
+                      {item.matchedDish?<div style={{fontSize:11,color:"#666",marginTop:1}}>Matched: <strong>{item.matchedDish.name}</strong> ({item.matchedDish.servingDescription})</div>:<div style={{fontSize:11,color:"#c0392b",marginTop:1}}>Not in database</div>}
+                      {item.visualCues&&<div style={{fontSize:11,color:"#888",fontStyle:"italic",marginTop:2}}>👁 {item.visualCues}</div>}
+                      <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8}}>
+                        <span style={{fontSize:12,color:"#555"}}>Multiplier:</span>
+                        <input type="number" step="0.05" min="0.1" max="10" value={item.servingMultiplier} onChange={e=>setMealItems(prev=>prev.map((it,i)=>i===idx?{...it,servingMultiplier:parseFloat(e.target.value)||1}:it))} style={{border:"1px solid #ddd",borderRadius:6,padding:"3px 8px",fontSize:12,width:70}}/>
+                        <span style={{fontSize:11,color:"#888"}}>× serving</span>
+                      </div>
+                      {item.matchedDish&&item.include&&<div style={{marginTop:6,fontSize:12,color:"#555",background:"rgba(255,255,255,0.7)",borderRadius:6,padding:"4px 8px"}}>{Math.round((item.matchedDish.nutrients.calories||0)*item.servingMultiplier)} kcal · {((item.matchedDish.nutrients.protein||0)*item.servingMultiplier).toFixed(1)}g protein</div>}
+                    </div>
+                  </div>
+                </div>
+              ))}
+              <div style={{marginTop:6,padding:10,background:"#e8f5e9",borderRadius:8,fontSize:12,color:"#1B4332",fontFamily:"monospace",fontWeight:700}}>
+                Total: {Math.round(mealItems.filter(i=>i.include&&i.matchedDish).reduce((s,i)=>s+(i.matchedDish.nutrients.calories||0)*i.servingMultiplier,0))} kcal · {mealItems.filter(i=>i.include&&i.matchedDish).reduce((s,i)=>s+(i.matchedDish.nutrients.protein||0)*i.servingMultiplier,0).toFixed(1)}g protein
+              </div>
+              <div style={{display:"flex",gap:10,marginTop:12}}>
+                <button onClick={()=>{setMealEstimate(null);setMealItems([]);}} style={{flex:1,padding:10,background:"transparent",border:"1px solid #ddd",borderRadius:8,fontSize:13,cursor:"pointer"}}>← Re-analyze</button>
+                <button onClick={commitMealLog} disabled={!mealItems.some(i=>i.include&&i.matchedDish)} style={{flex:2,padding:10,background:"#1B4332",color:"#fff",border:"none",borderRadius:8,fontSize:14,fontWeight:700,cursor:"pointer"}}>
+                  Log {mealItems.filter(i=>i.include&&i.matchedDish).length} Items
+                </button>
+              </div>
+            </div>
+          )}
+        </Modal>
+      )}
+
+      {/* ═══ ADD DISH MODAL ═══ */}
+      {showAddDish&&(
+        <Modal title={dishForm.isRecurring?"Add Recurring Item":"Add Dish"} onClose={()=>{setShowAddDish(false);setPendingDish(null);setAnalyzeError("");}}>
+          {!pendingDish?(
+            <div>
+              <div style={{marginBottom:12}}>
+                <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,cursor:"pointer"}}>
+                  <input type="checkbox" checked={dishForm.isRecurring} onChange={e=>setDishForm(f=>({...f,isRecurring:e.target.checked}))}/>
+                  <span style={{color:"#1B4332",fontWeight:600}}>Recurring daily item</span>
+                </label>
+              </div>
+              <div style={{marginBottom:12}}>
+                <label style={{fontSize:13,fontWeight:600,color:"#333",display:"block",marginBottom:6}}>Photo (optional)</label>
+                <div onClick={()=>fileRef.current?.click()} style={{border:"2px dashed #95B8A2",borderRadius:10,padding:14,textAlign:"center",cursor:"pointer",background:dishForm.imagePreview?"transparent":"#f8fff8"}}>
+                  {dishForm.imagePreview?<img src={dishForm.imagePreview} alt="preview" style={{maxHeight:130,borderRadius:8,maxWidth:"100%"}}/>:<div style={{color:"#95B8A2",fontSize:13}}>Tap to upload photo or label</div>}
+                </div>
+                <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}} onChange={e=>{const f=e.target.files[0];if(f)setDishForm(prev=>({...prev,image:f,imagePreview:URL.createObjectURL(f)}));}}/>
+              </div>
+              <div style={{marginBottom:14}}>
+                <label style={{fontSize:13,fontWeight:600,color:"#333",display:"block",marginBottom:6}}>Description / Nutrition Info</label>
+                <textarea value={dishForm.description} onChange={e=>setDishForm(f=>({...f,description:e.target.value}))} placeholder="Describe the dish, paste ingredient list, or type nutrition facts..." style={{...iS,height:90,resize:"vertical"}}/>
+              </div>
+              {analyzeError&&<div style={{color:"#c0392b",fontSize:13,marginBottom:10}}>{analyzeError}</div>}
+              <button onClick={analyzeDish} disabled={isAnalyzing||(!dishForm.image&&!dishForm.description)} style={{width:"100%",padding:12,background:isAnalyzing?"#95B8A2":"#1B4332",color:"#fff",border:"none",borderRadius:8,fontSize:14,fontWeight:600,cursor:isAnalyzing?"default":"pointer"}}>
+                {isAnalyzing?"Analyzing…":"Analyze Nutrients"}
+              </button>
+            </div>
+          ):(
+            <div>
+              <div style={{background:"#e8f5e9",borderRadius:10,padding:12,marginBottom:14}}>
+                <div style={{fontWeight:700,fontSize:15,color:"#1B4332"}}>{pendingDish.name}</div>
+                <div style={{fontSize:12,color:"#666",marginTop:2}}>{pendingDish.servingDescription}</div>
+                {pendingDish.notes&&<div style={{fontSize:12,color:"#555",fontStyle:"italic",marginTop:4}}>{pendingDish.notes}</div>}
+              </div>
+              <div style={{marginBottom:14}}>
+                {["calories","protein","carbohydrates","fiber","fat"].map(k=><NutrientBar key={k} label={NUTRIENT_LABELS[k]} value={pendingDish.nutrients[k]||0} dv={DV[k]} unit={UNITS[k]}/>)}
+                <div style={{fontSize:12,color:"#888",fontWeight:700,margin:"12px 0 8px"}}>KEY MICRONUTRIENTS</div>
+                {["vitaminA","vitaminC","vitaminD","calcium","iron","potassium","magnesium"].map(k=><NutrientBar key={k} label={NUTRIENT_LABELS[k]} value={pendingDish.nutrients[k]||0} dv={DV[k]} unit={UNITS[k]}/>)}
+              </div>
+              <div style={{display:"flex",gap:10}}>
+                <button onClick={()=>setPendingDish(null)} style={{flex:1,padding:10,background:"transparent",border:"1px solid #ddd",borderRadius:8,fontSize:13,cursor:"pointer"}}>← Re-analyze</button>
+                <button onClick={confirmDish} style={{flex:2,padding:10,background:"#1B4332",color:"#fff",border:"none",borderRadius:8,fontSize:14,fontWeight:600,cursor:"pointer"}}>Save to {pendingDish.isRecurring?"Recurring":"Database"}</button>
+              </div>
+            </div>
+          )}
+        </Modal>
+      )}
+
+      {/* ═══ BULK ADD MODAL ═══ */}
+      {showBulkAdd&&(
+        <Modal title="Bulk Add Dishes" wide onClose={()=>{setShowBulkAdd(false);setBulkPhotos([]);setBulkResults([]);setBulkDone(false);}}>
+          {!bulkDone?(
+            <div>
+              <div style={{fontSize:12,color:"#666",marginBottom:12,padding:10,background:"#e8f5e9",borderRadius:8}}>Upload photos of menu boards, nutrition sheets, or dishes. Claude extracts every item from each photo at once.</div>
+              {bulkPhotos.map((photo,idx)=>(
+                <div key={idx} style={{display:"flex",gap:10,marginBottom:10,background:"#fff",border:"1px solid #ddd",borderRadius:10,padding:10,alignItems:"flex-start"}}>
+                  <img src={photo.preview} alt="" style={{width:64,height:64,objectFit:"cover",borderRadius:7,flexShrink:0}}/>
+                  <div style={{flex:1}}>
+                    <input value={photo.description} onChange={e=>setBulkPhotos(prev=>prev.map((p,i)=>i===idx?{...p,description:e.target.value}:p))} placeholder="Optional description" style={{...iS,fontSize:12}}/>
+                    {photo.status==="processing"&&<div style={{fontSize:11,color:"#D4A017",marginTop:4}}>⏳ Analyzing…</div>}
+                    {photo.status==="done"&&<div style={{fontSize:11,color:"#1B4332",marginTop:4}}>✓ Found {photo.count} item{photo.count!==1?"s":""}</div>}
+                    {photo.status==="error"&&<div style={{fontSize:11,color:"#c0392b",marginTop:4}}>✗ {photo.error}</div>}
+                  </div>
+                  <button onClick={()=>setBulkPhotos(prev=>prev.filter((_,i)=>i!==idx))} style={{background:"none",border:"none",color:"#c0392b",fontSize:18,cursor:"pointer",flexShrink:0}}>✕</button>
+                </div>
+              ))}
+              <input ref={bulkFileRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={e=>{const files=Array.from(e.target.files);setBulkPhotos(prev=>[...prev,...files.map(f=>({file:f,preview:URL.createObjectURL(f),description:"",status:"pending",count:0}))]);e.target.value="";}}/>
+              <button onClick={()=>bulkFileRef.current?.click()} style={{width:"100%",padding:12,border:"2px dashed #95B8A2",borderRadius:9,background:"#f8fff8",color:"#1B4332",fontSize:13,fontWeight:600,cursor:"pointer",marginBottom:10}}>
+                {bulkPhotos.length===0?"📸 Select Photos":"📸 Add More Photos"}
+              </button>
+              {bulkPhotos.length>0&&(
+                <button onClick={startBulkAnalysis} disabled={bulkProcessing} style={{width:"100%",padding:12,background:bulkProcessing?"#95B8A2":"#1B4332",color:"#fff",border:"none",borderRadius:8,fontSize:14,fontWeight:700,cursor:bulkProcessing?"default":"pointer"}}>
+                  {bulkProcessing?`Analyzing ${bulkPhotos.length} photo${bulkPhotos.length>1?"s":""}…`:`Analyze ${bulkPhotos.length} Photo${bulkPhotos.length>1?"s":""}`}
+                </button>
+              )}
+            </div>
+          ):(
+            <div>
+              <div style={{fontSize:13,color:"#555",marginBottom:12}}>Found <strong style={{color:"#1B4332"}}>{bulkResults.length} dishes</strong> — uncheck any to skip.</div>
+              {bulkPhotos.map((photo,photoIdx)=>{
+                const items=bulkResults.filter(r=>r.photoIdx===photoIdx);
+                const conf={high:"#1B4332",medium:"#D4A017",low:"#c0392b"};
+                return(
+                  <div key={photoIdx} style={{marginBottom:16}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                      <img src={photo.preview} alt="" style={{width:32,height:32,objectFit:"cover",borderRadius:4}}/>
+                      <div style={{fontSize:12,fontWeight:700,color:"#888"}}>Photo {photoIdx+1} — {photo.status==="error"?<span style={{color:"#c0392b"}}>{photo.error}</span>:`${items.length} items`}</div>
+                    </div>
+                    {items.map(result=>(
+                      <div key={result.tempId} style={{display:"flex",gap:10,alignItems:"flex-start",padding:"10px 12px",background:result.selected?"#f8fff8":"#f5f5f5",border:`1px solid ${result.selected?"#95B8A2":"#ddd"}`,borderRadius:8,marginBottom:6,cursor:"pointer"}} onClick={()=>setBulkResults(prev=>prev.map(r=>r.tempId===result.tempId?{...r,selected:!r.selected}:r))}>
+                        <input type="checkbox" checked={result.selected} readOnly style={{marginTop:3,flexShrink:0}}/>
+                        <div style={{flex:1}}>
+                          <div style={{fontWeight:600,fontSize:13,color:"#1B4332"}}>{result.dish.name}</div>
+                          <div style={{fontSize:11,color:"#888"}}>{result.dish.servingDescription}</div>
+                          <div style={{fontSize:12,color:"#444",marginTop:2}}>{result.dish.nutrients.calories} kcal · {result.dish.nutrients.protein}g protein · {result.dish.nutrients.carbohydrates}g carbs · {result.dish.nutrients.fat}g fat</div>
+                        </div>
+                        <div style={{fontSize:10,color:conf[result.dish.confidence]||"#666",flexShrink:0}}>● {result.dish.confidence}</div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+              <div style={{display:"flex",gap:10,marginTop:6}}>
+                <button onClick={()=>{setBulkDone(false);setBulkResults([]);setBulkPhotos(prev=>prev.map(p=>({...p,status:"pending",count:0})));}} style={{flex:1,padding:10,background:"transparent",border:"1px solid #ddd",borderRadius:8,fontSize:13,cursor:"pointer"}}>← Re-analyze</button>
+                <button onClick={confirmBulkAdd} disabled={!bulkResults.some(r=>r.selected)} style={{flex:2,padding:10,background:"#1B4332",color:"#fff",border:"none",borderRadius:8,fontSize:14,fontWeight:700,cursor:"pointer"}}>
+                  Save {bulkResults.filter(r=>r.selected).length} Dishes
+                </button>
+              </div>
+            </div>
+          )}
+        </Modal>
+      )}
+
+      {/* ═══ SUPPLEMENT MODAL ═══ */}
+      {showAddSupplement&&(
+        <Modal title="Add Supplement / Name-Brand" onClose={()=>{setShowAddSupplement(false);setAnalyzeError("");}}>
+          <div>
+            <div style={{marginBottom:12}}>
+              <label style={{fontSize:13,fontWeight:600,color:"#333",display:"block",marginBottom:6}}>Product Name</label>
+              <input value={suppForm.name} onChange={e=>setSuppForm(f=>({...f,name:e.target.value}))} placeholder="e.g. Garden of Life Sport Protein, Kirkland Vitamin D3" style={iS}/>
+            </div>
+            <div style={{marginBottom:14}}>
+              <label style={{fontSize:13,fontWeight:600,color:"#333",display:"block",marginBottom:6}}>Extra Details (optional)</label>
+              <textarea value={suppForm.extraInfo} onChange={e=>setSuppForm(f=>({...f,extraInfo:e.target.value}))} placeholder="Flavor, serving size, any label info..." style={{...iS,height:70,resize:"vertical"}}/>
+            </div>
+            {analyzeError&&<div style={{color:"#c0392b",fontSize:13,marginBottom:10}}>{analyzeError}</div>}
+            <button onClick={analyzeSupplement} disabled={isAnalyzing||!suppForm.name.trim()} style={{width:"100%",padding:12,background:isAnalyzing?"#95B8A2":"#1B4332",color:"#fff",border:"none",borderRadius:8,fontSize:14,fontWeight:600,cursor:isAnalyzing?"default":"pointer"}}>
+              {isAnalyzing?"Looking up…":"Look Up & Add"}
+            </button>
+          </div>
+        </Modal>
+      )}
+
+      {/* ═══ DAILY SUMMARY MODAL ═══ */}
+      {showDailySummary&&(
+        <Modal title={`Daily Report — ${selectedDate}`} onClose={()=>setShowDailySummary(false)}>
+          <div>
+            <div style={{marginBottom:14,padding:14,background:"#e8f5e9",borderRadius:10}}>
+              <div style={{fontSize:13,color:"#555"}}>{todayEntries.length} meal{todayEntries.length!==1?"s":""}{ recurringItems.length>0?` + ${recurringItems.length} recurring`:""}</div>
+              <div style={{fontSize:24,fontWeight:700,color:"#1B4332",fontFamily:"monospace"}}>{Math.round(totals.calories)} kcal</div>
+              <div style={{fontSize:13,color:"#666"}}>{Math.round((totals.calories/DV.calories)*100)}% of daily target</div>
+            </div>
+            {Object.entries(NUTRIENT_GROUPS).map(([group,keys])=>(
+              <div key={group} style={{marginBottom:16}}>
+                <div style={{fontSize:11,color:"#888",fontWeight:700,letterSpacing:"0.5px",marginBottom:8}}>{group.toUpperCase()}</div>
+                {keys.map(k=><NutrientBar key={k} label={NUTRIENT_LABELS[k]} value={parseFloat(totals[k].toFixed(2))} dv={DV[k]} unit={UNITS[k]}/>)}
+              </div>
+            ))}
+            <div style={{marginTop:14,padding:12,background:"#fff3cd",borderRadius:8,fontSize:12,color:"#856404"}}><strong>Note:</strong> Micronutrient estimates for whole foods are approximations.</div>
+          </div>
+        </Modal>
+      )}
+
+      {/* ═══ SYNC MODAL ═══ */}
+      {showImportExport&&(
+        <Modal title="Sync Between Devices" onClose={()=>{setShowImportExport(false);setImportText("");setImportError("");setImportSuccess("");setExportCopied("");}}>
+          <div>
+            <div style={{marginBottom:20}}>
+              <div style={{fontSize:14,fontWeight:700,color:"#1B4332",marginBottom:4}}>Export</div>
+              <div style={{fontSize:12,color:"#666",marginBottom:10}}>Copies data to clipboard as JSON. Paste it into Notes to transfer to another device.</div>
+              <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                <button onClick={()=>exportData("database")} style={{padding:"12px 16px",background:exportCopied==="database"?"#2d6a4f":"#1B4332",color:"#fff",border:"none",borderRadius:9,fontSize:13,fontWeight:600,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <div><div>{exportCopied==="database"?"✓ Copied!":"📦 Copy Dish Database"}</div><div style={{fontSize:11,fontWeight:400,color:"#95B8A2",marginTop:2}}>{dishDatabase.length} dishes + {recurringItems.length} recurring</div></div>
+                  <span>{exportCopied==="database"?"✓":"⎘"}</span>
+                </button>
+                <button onClick={()=>exportData("full")} style={{padding:"12px 16px",background:exportCopied==="full"?"#2d6a4f":"#40826D",color:"#fff",border:"none",borderRadius:9,fontSize:13,fontWeight:600,cursor:"pointer",textAlign:"left",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <div><div>{exportCopied==="full"?"✓ Copied!":"🗃 Copy Full Backup"}</div><div style={{fontSize:11,fontWeight:400,color:"#95B8A2",marginTop:2}}>Database + {Object.keys(dailyLog).length} days of logs</div></div>
+                  <span>{exportCopied==="full"?"✓":"⎘"}</span>
+                </button>
+              </div>
+              {(exportCopied.includes("_fallback_"))&&(
+                <div style={{marginTop:10}}>
+                  <div style={{fontSize:12,color:"#856404",marginBottom:6}}>Clipboard blocked — select all and copy manually:</div>
+                  <textarea readOnly value={exportCopied.replace(/^(database|full)_fallback_/,"")} onFocus={e=>e.target.select()} style={{width:"100%",height:80,fontSize:11,fontFamily:"monospace",border:"1px solid #ddd",borderRadius:8,padding:8,resize:"vertical",boxSizing:"border-box",background:"#f9f9f9"}}/>
+                </div>
+              )}
+            </div>
+            <div style={{borderTop:"1px solid #e8e8e0",marginBottom:18}}/>
+            <div>
+              <div style={{fontSize:14,fontWeight:700,color:"#1B4332",marginBottom:4}}>Import</div>
+              <div style={{fontSize:12,color:"#666",marginBottom:10}}>Paste your NutriLog JSON below. Duplicates are skipped automatically.</div>
+              <textarea value={importText} onChange={e=>{setImportText(e.target.value);setImportError("");setImportSuccess("");}} placeholder='Paste NutriLog JSON here...' style={{...iS,height:100,fontFamily:"monospace",fontSize:12,resize:"vertical"}}/>
+              <button onClick={handleImportText} disabled={!importText.trim()} style={{marginTop:10,width:"100%",padding:11,background:importText.trim()?"#1B4332":"#ccc",color:"#fff",border:"none",borderRadius:8,fontSize:13,fontWeight:600,cursor:importText.trim()?"pointer":"default"}}>Import Data</button>
+              {importError&&<div style={{marginTop:10,padding:10,background:"#fff0f0",border:"1px solid #f5c6c6",borderRadius:8,fontSize:13,color:"#c0392b"}}>{importError}</div>}
+              {importSuccess&&<div style={{marginTop:10,padding:10,background:"#e8f5e9",border:"1px solid #95B8A2",borderRadius:8,fontSize:13,color:"#1B4332",fontWeight:600}}>{importSuccess}</div>}
+            </div>
+            <div style={{marginTop:16,padding:12,background:"#f0f4ff",borderRadius:8,fontSize:12,color:"#444",lineHeight:1.8}}>
+              <strong>How to sync:</strong><br/>1. Tap Copy Dish Database above<br/>2. Paste into Notes / iMessage / email → send to phone<br/>3. On phone: open NutriLog → ⇅ Sync → paste → Import
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
